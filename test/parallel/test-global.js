@@ -49,6 +49,7 @@ builtinModules.forEach((moduleName) => {
     'clearImmediate',
     'clearInterval',
     'clearTimeout',
+    'navigator',
     'atob',
     'btoa',
     'performance',
