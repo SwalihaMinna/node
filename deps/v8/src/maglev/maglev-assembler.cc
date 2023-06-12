@@ -9,6 +9,30 @@ namespace v8 {
 namespace internal {
 namespace maglev {
 
+#define __ masm->
+
+void MaglevAssembler::AllocateHeapNumber(RegisterSnapshot register_snapshot,
+                                         Register result,
+                                         DoubleRegister value) {
+  // In the case we need to call the runtime, we should spill the value
+  // register. Even if it is not live in the next node, otherwise the
+  // allocation call might trash it.
+  register_snapshot.live_double_registers.set(value);
+  Allocate(register_snapshot, result, HeapNumber::kSize);
+  SetMapAsRoot(result, RootIndex::kHeapNumberMap);
+  Move(FieldMemOperand(result, HeapNumber::kValueOffset), value);
+}
+
+void MaglevAssembler::AllocateTwoByteString(RegisterSnapshot register_snapshot,
+                                            Register result, int length) {
+  int size = SeqTwoByteString::SizeFor(length);
+  Allocate(register_snapshot, result, size);
+  StoreInt32Field(result, size - kObjectAlignment, 0);
+  SetMapAsRoot(result, RootIndex::kStringMap);
+  StoreInt32Field(result, Name::kRawHashFieldOffset, Name::kEmptyHashField);
+  StoreInt32Field(result, String::kLengthOffset, length);
+}
+
 Register MaglevAssembler::FromAnyToRegister(const Input& input,
                                             Register scratch) {
   if (input.operand().IsConstant()) {
@@ -59,6 +83,126 @@ void MaglevAssembler::LoadDataField(const PolymorphicAccessInfo& access_info,
   }
   AssertNotSmi(load_source);
   DecompressTagged(result, FieldMemOperand(load_source, field_index.offset()));
+}
+
+void MaglevAssembler::JumpIfNotUndetectable(Register object, Register scratch,
+                                            CheckType check_type, Label* target,
+                                            Label::Distance distance) {
+  if (check_type == CheckType::kCheckHeapObject) {
+    JumpIfSmi(object, target, distance);
+  } else if (v8_flags.debug_code) {
+    AssertNotSmi(object);
+  }
+  // For heap objects, check the map's undetectable bit.
+  LoadMap(scratch, object);
+  LoadByte(scratch, FieldMemOperand(scratch, Map::kBitFieldOffset));
+  TestInt32AndJumpIfAllClear(scratch, Map::Bits1::IsUndetectableBit::kMask,
+                             target, distance);
+}
+
+void MaglevAssembler::JumpIfUndetectable(Register object, Register scratch,
+                                         CheckType check_type, Label* target,
+                                         Label::Distance distance) {
+  Label detectable;
+  if (check_type == CheckType::kCheckHeapObject) {
+    JumpIfSmi(object, &detectable, Label::kNear);
+  } else if (v8_flags.debug_code) {
+    AssertNotSmi(object);
+  }
+  // For heap objects, check the map's undetectable bit.
+  LoadMap(scratch, object);
+  LoadByte(scratch, FieldMemOperand(scratch, Map::kBitFieldOffset));
+  TestInt32AndJumpIfAnySet(scratch, Map::Bits1::IsUndetectableBit::kMask,
+                           target, distance);
+  bind(&detectable);
+}
+
+void MaglevAssembler::EnsureWritableFastElements(
+    RegisterSnapshot register_snapshot, Register elements, Register object,
+    Register scratch) {
+  ZoneLabelRef done(this);
+  CompareMapWithRoot(elements, RootIndex::kFixedArrayMap, scratch);
+  JumpToDeferredIf(
+      kNotEqual,
+      [](MaglevAssembler* masm, ZoneLabelRef done, Register object,
+         Register result_reg, RegisterSnapshot snapshot) {
+        {
+          snapshot.live_registers.clear(result_reg);
+          snapshot.live_tagged_registers.clear(result_reg);
+          SaveRegisterStateForCall save_register_state(masm, snapshot);
+          __ CallBuiltin<Builtin::kCopyFastSmiOrObjectElements>(object);
+          save_register_state.DefineSafepoint();
+          __ Move(result_reg, kReturnRegister0);
+        }
+        __ Jump(*done);
+      },
+      done, object, elements, register_snapshot);
+  bind(*done);
+}
+
+void MaglevAssembler::ToBoolean(Register value, CheckType check_type,
+                                ZoneLabelRef is_true, ZoneLabelRef is_false,
+                                bool fallthrough_when_true) {
+  ScratchRegisterScope temps(this);
+  Register map = temps.GetDefaultScratchRegister();
+
+  if (check_type == CheckType::kCheckHeapObject) {
+    // Check if {{value}} is Smi.
+    Condition is_smi = CheckSmi(value);
+    JumpToDeferredIf(
+        is_smi,
+        [](MaglevAssembler* masm, Register value, ZoneLabelRef is_true,
+           ZoneLabelRef is_false) {
+          // Check if {value} is not zero.
+          __ CompareSmiAndJumpIf(value, Smi::FromInt(0), kEqual, *is_false);
+          __ Jump(*is_true);
+        },
+        value, is_true, is_false);
+  } else if (v8_flags.debug_code) {
+    AssertNotSmi(value);
+  }
+  // Check if {{value}} is false.
+  CompareRoot(value, RootIndex::kFalseValue);
+  JumpIf(kEqual, *is_false);
+
+  // Check if {{value}} is empty string.
+  CompareRoot(value, RootIndex::kempty_string);
+  JumpIf(kEqual, *is_false);
+
+  // Check if {{value}} is undetectable.
+  LoadMap(map, value);
+  TestInt32AndJumpIfAnySet(FieldMemOperand(map, Map::kBitFieldOffset),
+                           Map::Bits1::IsUndetectableBit::kMask, *is_false);
+
+  // Check if {{value}} is a HeapNumber.
+  CompareRoot(map, RootIndex::kHeapNumberMap);
+  JumpToDeferredIf(
+      kEqual,
+      [](MaglevAssembler* masm, Register value, ZoneLabelRef is_true,
+         ZoneLabelRef is_false) {
+        __ CompareDoubleAndJumpIfZeroOrNaN(
+            FieldMemOperand(value, HeapNumber::kValueOffset), *is_false);
+        __ Jump(*is_true);
+      },
+      value, is_true, is_false);
+
+  // Check if {{value}} is a BigInt.
+  CompareRoot(map, RootIndex::kBigIntMap);
+  JumpToDeferredIf(
+      kEqual,
+      [](MaglevAssembler* masm, Register value, ZoneLabelRef is_true,
+         ZoneLabelRef is_false) {
+        __ TestInt32AndJumpIfAllClear(
+            FieldMemOperand(value, BigInt::kBitfieldOffset),
+            BigInt::LengthBits::kMask, *is_false);
+        __ Jump(*is_true);
+      },
+      value, is_true, is_false);
+
+  // Otherwise true.
+  if (!fallthrough_when_true) {
+    Jump(*is_true);
+  }
 }
 
 }  // namespace maglev

@@ -76,8 +76,7 @@ Handle<WasmModuleObject> CompileReferenceModule(
           "Liftoff compilation failed on a valid module. Run with "
           "--trace-wasm-decoder (in a debug build) to see why.");
     }
-    native_module->PublishCode(
-        native_module->AddCompiledCode(std::move(result)));
+    native_module->PublishCode(native_module->AddCompiledCode(result));
   }
 
   // Create the module object.
@@ -137,6 +136,16 @@ void ExecuteAgainstReference(Isolate* isolate,
   // If there is nondeterminism, we cannot guarantee the behavior of the test
   // module, and in particular it may not terminate.
   if (nondeterminism != 0) return;
+
+  if (exception_ref) {
+    if (strcmp(exception_ref.get(),
+               "RangeError: Maximum call stack size exceeded") == 0) {
+      // There was a stack overflow, which may happen nondeterministically. We
+      // cannot guarantee the behavior of the test module, and in particular it
+      // may not terminate.
+      return;
+    }
+  }
 
   // Instantiate a fresh instance for the actual (non-ref) execution.
   Handle<WasmInstanceObject> instance;
@@ -322,6 +331,7 @@ class InitExprInterface {
  public:
   using ValidationTag = Decoder::FullValidationTag;
   static constexpr DecodingMode decoding_mode = kConstantExpression;
+  static constexpr bool kUsesPoppedArgs = false;
 
   struct Value : public ValueBase<ValidationTag> {
     template <typename... Args>
@@ -416,39 +426,39 @@ class InitExprInterface {
 
   // The following operations assume non-rtt versions of the instructions.
   void StructNew(FullDecoder* decoder, const StructIndexImmediate& imm,
-                 const Value& rtt, const Value args[], Value* result) {
+                 const Value args[], Value* result) {
     os_ << "kGCPrefix, kExprStructNew, " << index(imm.index);
   }
 
   void StructNewDefault(FullDecoder* decoder, const StructIndexImmediate& imm,
-                        const Value& rtt, Value* result) {
+                        Value* result) {
     os_ << "kGCPrefix, kExprStructNewDefault, " << index(imm.index);
   }
 
   void ArrayNew(FullDecoder* decoder, const ArrayIndexImmediate& imm,
                 const Value& length, const Value& initial_value,
-                const Value& rtt, Value* result) {
+                Value* result) {
     os_ << "kGCPrefix, kExprArrayNew, " << index(imm.index);
   }
 
   void ArrayNewDefault(FullDecoder* decoder, const ArrayIndexImmediate& imm,
-                       const Value& length, const Value& rtt, Value* result) {
+                       const Value& length, Value* result) {
     os_ << "kGCPrefix, kExprArrayNewDefault, " << index(imm.index);
   }
 
-  void ArrayNewFixed(FullDecoder* decoder, const ArrayIndexImmediate& imm,
-                     const base::Vector<Value>& elements, const Value& rtt,
+  void ArrayNewFixed(FullDecoder* decoder, const ArrayIndexImmediate& array_imm,
+                     const IndexImmediate& length_imm, const Value elements[],
                      Value* result) {
-    os_ << "kGCPrefix, kExprArrayNewFixed, " << index(imm.index)
-        << index(static_cast<uint32_t>(elements.size()));
+    os_ << "kGCPrefix, kExprArrayNewFixed, " << index(array_imm.index)
+        << index(length_imm.index);
   }
 
   void ArrayNewSegment(FullDecoder* decoder,
                        const ArrayIndexImmediate& array_imm,
                        const IndexImmediate& data_segment_imm,
                        const Value& offset_value, const Value& length_value,
-                       const Value& rtt, Value* result) {
-    // TODO(7748): Implement.
+                       Value* result) {
+    // TODO(14034): Implement. Needed when/if array.newData becomes const.
     UNIMPLEMENTED();
   }
 
@@ -553,12 +563,20 @@ void GenerateTestCase(Isolate* isolate, ModuleWireBytes wire_bytes,
            << ")";
         if (index + 1 < field_count) os << ", ";
       }
-      os << "]);\n";
+      os << "]";
+      if (module->types[i].supertype != kNoSuperType) {
+        os << ", " << module->types[i].supertype;
+      }
+      os << ");\n";
     } else if (module->has_array(i)) {
       const ArrayType* array_type = module->types[i].array_type;
       os << "builder.addArray("
          << ValueTypeToConstantName(array_type->element_type()) << ", "
-         << (array_type->mutability() ? "true" : "false") << ");\n";
+         << (array_type->mutability() ? "true" : "false");
+      if (module->types[i].supertype != kNoSuperType) {
+        os << ", " << module->types[i].supertype;
+      }
+      os << ");\n";
     } else {
       DCHECK(module->has_signature(i));
       const FunctionSig* sig = module->types[i].function_sig;
@@ -577,15 +595,15 @@ void GenerateTestCase(Isolate* isolate, ModuleWireBytes wire_bytes,
        << sig_index << " /* sig */);\n";
   }
 
-  if (module->has_memory) {
-    os << "builder.addMemory(" << module->initial_pages;
-    if (module->has_maximum_pages) {
-      os << ", " << module->maximum_pages;
+  for (const WasmMemory& memory : module->memories) {
+    os << "builder.addMemory(" << memory.initial_pages;
+    if (memory.has_maximum_pages) {
+      os << ", " << memory.maximum_pages;
     } else {
       os << ", undefined";
     }
-    os << ", " << (module->mem_export ? "true" : "false");
-    if (module->has_shared_memory) {
+    os << ", " << (memory.exported ? "true" : "false");
+    if (memory.is_shared) {
       os << ", true";
     }
     os << ");\n";

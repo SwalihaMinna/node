@@ -385,7 +385,13 @@ MemoryAllocator::AllocateUninitializedChunkAt(BaseSpace* space,
       // first.
       ZapBlock(base, MemoryChunkLayout::CodePageGuardStartOffset(), kZapValue);
       // Now zap object area.
-      ZapBlock(base + MemoryChunkLayout::ObjectStartOffsetInCodePage(),
+      Address code_start =
+          base + MemoryChunkLayout::ObjectPageOffsetInCodePage();
+      CodePageMemoryModificationScopeForDebugging memory_write_scope(
+          isolate_->heap(), &reservation,
+          base::AddressRegion(code_start,
+                              RoundUp(area_size, GetCommitPageSize())));
+      ZapBlock(base + MemoryChunkLayout::ObjectPageOffsetInCodePage(),
                area_size, kZapValue);
     } else {
       DCHECK_EQ(executable, NOT_EXECUTABLE);
@@ -466,8 +472,9 @@ void MemoryAllocator::UnregisterBasicMemoryChunk(BasicMemoryChunk* chunk,
 #ifdef DEBUG
     UnregisterExecutableMemoryChunk(static_cast<MemoryChunk*>(chunk));
 #endif  // DEBUG
-    chunk->heap()->UnregisterUnprotectedMemoryChunk(
-        static_cast<MemoryChunk*>(chunk));
+
+    ThreadIsolation::UnregisterJitPage(
+        chunk->address() + MemoryChunkLayout::ObjectPageOffsetInCodePage());
   }
   chunk->SetFlag(MemoryChunk::UNREGISTERED);
 }
@@ -532,10 +539,11 @@ void MemoryAllocator::PerformFreeMemory(MemoryChunk* chunk) {
 }
 
 void MemoryAllocator::Free(MemoryAllocator::FreeMode mode, MemoryChunk* chunk) {
-  if (chunk->IsLargePage())
-    RecordLargePageDestroyed(*static_cast<LargePage*>(chunk));
-  else
-    RecordNormalPageDestroyed(*static_cast<Page*>(chunk));
+  if (chunk->IsLargePage()) {
+    RecordLargePageDestroyed(*LargePage::cast(chunk));
+  } else {
+    RecordNormalPageDestroyed(*Page::cast(chunk));
+  }
   switch (mode) {
     case FreeMode::kImmediately:
       PreFreeMemory(chunk);
@@ -752,13 +760,12 @@ bool MemoryAllocator::SetPermissionsOnExecutableMemoryChunk(VirtualMemory* vm,
         // Commit the executable code body.
         bool set_permission_successed = false;
 #if V8_HEAP_USE_PKU_JIT_WRITE_PROTECT
-        if (!jitless && RwxMemoryWriteScope::IsSupported()) {
+        if (ThreadIsolation::Enabled()) {
+          DCHECK(!jitless);
           base::AddressRegion region(code_area, aligned_area_size);
           set_permission_successed =
-              base::MemoryProtectionKey::SetPermissionsAndKey(
-                  code_page_allocator_, region,
-                  PageAllocator::kReadWriteExecute,
-                  RwxMemoryWriteScope::memory_protection_key());
+              ThreadIsolation::RegisterJitPageAndMakeExecutable(
+                  code_area, aligned_area_size);
         } else
 #endif
         {
@@ -786,20 +793,26 @@ bool MemoryAllocator::SetPermissionsOnExecutableMemoryChunk(VirtualMemory* vm,
   return false;
 }
 
-// static
-const MemoryChunk* MemoryAllocator::LookupChunkContainingAddress(
-    const NormalPagesSet& normal_pages, const LargePagesSet& large_pages,
-    Address addr) {
+#ifdef V8_ENABLE_CONSERVATIVE_STACK_SCANNING
+
+const BasicMemoryChunk* MemoryAllocator::LookupChunkContainingAddress(
+    Address addr) const {
+  // All threads should be either parked or in a safepoint whenever this method
+  // is called, thus pages cannot be allocated or freed at the same time and a
+  // mutex is not required here.
+  // As the address may not correspond to a valid heap object, the chunk we
+  // obtain below is not necessarily a valid chunk.
   BasicMemoryChunk* chunk = BasicMemoryChunk::FromAddress(addr);
-  if (auto it = normal_pages.find(static_cast<Page*>(chunk));
-      it != normal_pages.end()) {
+  // Check if it corresponds to a known normal or large page.
+  if (auto it = normal_pages_.find(chunk); it != normal_pages_.end()) {
     // The chunk is a normal page.
-    DCHECK_LE(chunk->address(), addr);
-    if (chunk->Contains(addr)) return *it;
-  } else if (auto it = large_pages.upper_bound(static_cast<LargePage*>(chunk));
-             it != large_pages.begin()) {
+    auto* normal_page = Page::cast(chunk);
+    DCHECK_LE(normal_page->address(), addr);
+    if (normal_page->Contains(addr)) return normal_page;
+  } else if (auto it = large_pages_.upper_bound(chunk);
+             it != large_pages_.begin()) {
     // The chunk could be inside a large page.
-    DCHECK_IMPLIES(it != large_pages.end(), addr < (*it)->address());
+    DCHECK_IMPLIES(it != large_pages_.end(), addr < (*it)->address());
     auto* large_page = *std::next(it, -1);
     DCHECK_NOT_NULL(large_page);
     DCHECK_LE(large_page->address(), addr);
@@ -809,44 +822,42 @@ const MemoryChunk* MemoryAllocator::LookupChunkContainingAddress(
   return nullptr;
 }
 
-const MemoryChunk* MemoryAllocator::LookupChunkContainingAddress(
-    Address addr) const {
-  // All threads should be either parked or in a safepoint whenever this method
-  // is called, thus pages cannot be allocated or freed at the same time and a
-  // mutex is not required here,
-  return LookupChunkContainingAddress(normal_pages_, large_pages_, addr);
-}
+#endif  // V8_ENABLE_CONSERVATIVE_STACK_SCANNING
 
 void MemoryAllocator::RecordNormalPageCreated(const Page& page) {
+#ifdef V8_ENABLE_CONSERVATIVE_STACK_SCANNING
   base::MutexGuard guard(&pages_mutex_);
   auto result = normal_pages_.insert(&page);
   USE(result);
   DCHECK(result.second);
+#endif  // V8_ENABLE_CONSERVATIVE_STACK_SCANNING
 }
 
 void MemoryAllocator::RecordNormalPageDestroyed(const Page& page) {
+#ifdef V8_ENABLE_CONSERVATIVE_STACK_SCANNING
   base::MutexGuard guard(&pages_mutex_);
-  DCHECK_IMPLIES(v8_flags.minor_mc && isolate_->heap()->sweeping_in_progress(),
-                 isolate_->heap()->tracer()->IsInAtomicPause());
   auto size = normal_pages_.erase(&page);
   USE(size);
   DCHECK_EQ(1u, size);
+#endif  // V8_ENABLE_CONSERVATIVE_STACK_SCANNING
 }
 
 void MemoryAllocator::RecordLargePageCreated(const LargePage& page) {
+#ifdef V8_ENABLE_CONSERVATIVE_STACK_SCANNING
   base::MutexGuard guard(&pages_mutex_);
   auto result = large_pages_.insert(&page);
   USE(result);
   DCHECK(result.second);
+#endif  // V8_ENABLE_CONSERVATIVE_STACK_SCANNING
 }
 
 void MemoryAllocator::RecordLargePageDestroyed(const LargePage& page) {
+#ifdef V8_ENABLE_CONSERVATIVE_STACK_SCANNING
   base::MutexGuard guard(&pages_mutex_);
-  DCHECK_IMPLIES(v8_flags.minor_mc && isolate_->heap()->sweeping_in_progress(),
-                 isolate_->heap()->tracer()->IsInAtomicPause());
   auto size = large_pages_.erase(&page);
   USE(size);
   DCHECK_EQ(1u, size);
+#endif  // V8_ENABLE_CONSERVATIVE_STACK_SCANNING
 }
 
 }  // namespace internal

@@ -24,7 +24,7 @@ class WasmFeatures;
 // Representation of an constant expression. Unlike {ConstantExpression}, this
 // does not use {WireBytesRef}, i.e., it does not depend on a wasm module's
 // bytecode representation.
-// TODO(manoskouk): Add missing kinds of expressions.
+// TODO(7748): Add missing kinds of expressions.
 class WasmInitExpr : public ZoneObject {
  public:
   enum Operator {
@@ -202,9 +202,6 @@ class WasmInitExpr : public ZoneObject {
   V8_INLINE bool operator!=(const WasmInitExpr& other) const {
     return !(*this == other);
   }
-
-  ValueType type(const WasmModule* module,
-                 const WasmFeatures& enabled_features) const;
 
  private:
   WasmInitExpr(Operator kind, const ZoneVector<WasmInitExpr>* operands)

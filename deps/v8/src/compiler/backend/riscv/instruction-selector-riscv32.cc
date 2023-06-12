@@ -33,7 +33,7 @@ bool RiscvOperandGenerator::CanBeImmediate(int64_t value,
     case kRiscvAnd:
     case kRiscvOr32:
     case kRiscvOr:
-    case kRiscvTst:
+    case kRiscvTst32:
     case kRiscvXor:
       return is_int12(value);
     case kRiscvLb:
@@ -198,6 +198,8 @@ void InstructionSelector::VisitLoad(Node* node) {
 
   EmitLoad(this, node, opcode);
 }
+
+void InstructionSelector::VisitStorePair(Node* node) { UNREACHABLE(); }
 
 void InstructionSelector::VisitStore(Node* node) {
   RiscvOperandGenerator g(this);
@@ -718,8 +720,8 @@ void VisitAtomicStore(InstructionSelector* selector, Node* node,
   if (g.CanBeImmediate(index, opcode)) {
     selector->Emit(opcode | AddressingModeField::encode(kMode_MRI) |
                        AtomicWidthField::encode(width),
-                   g.NoOutput(), g.UseRegister(base), g.UseImmediate(index),
-                   g.UseRegisterOrImmediateZero(value));
+                   g.NoOutput(), g.UseRegisterOrImmediateZero(value),
+                   g.UseRegister(base), g.UseImmediate(index));
   } else {
     InstructionOperand addr_reg = g.TempRegister();
     selector->Emit(kRiscvAdd32 | AddressingModeField::encode(kMode_None),
@@ -727,8 +729,8 @@ void VisitAtomicStore(InstructionSelector* selector, Node* node,
     // Emit desired store opcode, using temp addr_reg.
     selector->Emit(opcode | AddressingModeField::encode(kMode_MRI) |
                        AtomicWidthField::encode(width),
-                   g.NoOutput(), addr_reg, g.TempImmediate(0),
-                   g.UseRegisterOrImmediateZero(value));
+                   g.NoOutput(), g.UseRegisterOrImmediateZero(value), addr_reg,
+                   g.TempImmediate(0));
   }
 }
 
@@ -877,7 +879,7 @@ void InstructionSelector::VisitWordCompareZero(Node* user, Node* value,
         }
         break;
       case IrOpcode::kWord32And:
-        return VisitWordCompare(this, value, kRiscvTst, cont, true);
+        return VisitWordCompare(this, value, kRiscvTst32, cont, true);
       case IrOpcode::kStackPointerGreaterThan:
         cont->OverwriteAndNegateIfEqual(kStackPointerGreaterThanCondition);
         return VisitStackPointerGreaterThan(value, cont);
@@ -1134,6 +1136,23 @@ void InstructionSelector::VisitInt32PairSub(Node* node) {
 
 void InstructionSelector::VisitInt32PairMul(Node* node) {
   VisitInt32PairBinop<4>(this, kRiscvMulPair, kRiscvMul32, node);
+}
+
+void InstructionSelector::VisitI64x2SplatI32Pair(Node* node) {
+  RiscvOperandGenerator g(this);
+  InstructionOperand low = g.UseRegister(node->InputAt(0));
+  InstructionOperand high = g.UseRegister(node->InputAt(1));
+  Emit(kRiscvI64x2SplatI32Pair, g.DefineAsRegister(node), low, high);
+}
+
+void InstructionSelector::VisitI64x2ReplaceLaneI32Pair(Node* node) {
+  RiscvOperandGenerator g(this);
+  InstructionOperand operand = g.UseRegister(node->InputAt(0));
+  InstructionOperand lane = g.UseImmediate(OpParameter<int32_t>(node->op()));
+  InstructionOperand low = g.UseRegister(node->InputAt(1));
+  InstructionOperand high = g.UseRegister(node->InputAt(2));
+  Emit(kRiscvI64x2ReplaceLaneI32Pair, g.DefineSameAsFirst(node), operand, lane,
+       low, high);
 }
 
 // Shared routine for multiple shift operations.

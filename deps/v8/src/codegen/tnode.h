@@ -15,6 +15,7 @@ class BigInt;
 class Object;
 class Smi;
 class TaggedIndex;
+class Oddball;
 
 namespace compiler {
 
@@ -85,6 +86,10 @@ struct UintPtrT : WordT {
 };
 
 struct ExternalPointerHandleT : Uint32T {
+  static constexpr MachineType kMachineType = MachineType::Uint32();
+};
+
+struct CodePointerHandleT : Uint32T {
   static constexpr MachineType kMachineType = MachineType::Uint32();
 };
 

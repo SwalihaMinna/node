@@ -18,7 +18,7 @@ namespace internal {
 class LocalHeap;
 
 HandleBase::HandleBase(Address object, Isolate* isolate)
-    : location_(HandleScope::GetHandle(isolate, object)) {}
+    : location_(HandleScope::CreateHandle(isolate, object)) {}
 
 HandleBase::HandleBase(Address object, LocalIsolate* isolate)
     : location_(LocalHandleScope::GetHandle(isolate->heap(), object)) {}
@@ -36,7 +36,7 @@ bool HandleBase::is_identical_to(const HandleBase that) const {
 
 // Allocate a new handle for the object, do not canonicalize.
 template <typename T>
-Handle<T> Handle<T>::New(T object, Isolate* isolate) {
+Handle<T> Handle<T>::New(Tagged<T> object, Isolate* isolate) {
   return Handle(HandleScope::CreateHandle(isolate, object.ptr()));
 }
 
@@ -48,30 +48,48 @@ const Handle<T> Handle<T>::cast(Handle<S> that) {
 }
 
 template <typename T>
-Handle<T>::Handle(T object, Isolate* isolate)
+Handle<T>::Handle(Tagged<T> object, Isolate* isolate)
     : HandleBase(object.ptr(), isolate) {}
 
 template <typename T>
-Handle<T>::Handle(T object, LocalIsolate* isolate)
+Handle<T>::Handle(Tagged<T> object, LocalIsolate* isolate)
     : HandleBase(object.ptr(), isolate) {}
 
 template <typename T>
-Handle<T>::Handle(T object, LocalHeap* local_heap)
+Handle<T>::Handle(Tagged<T> object, LocalHeap* local_heap)
     : HandleBase(object.ptr(), local_heap) {}
 
 template <typename T>
-V8_INLINE Handle<T> handle(T object, Isolate* isolate) {
+V8_INLINE Handle<T> handle(Tagged<T> object, Isolate* isolate) {
   return Handle<T>(object, isolate);
+}
+
+template <typename T>
+V8_INLINE Handle<T> handle(Tagged<T> object, LocalIsolate* isolate) {
+  return Handle<T>(object, isolate);
+}
+
+template <typename T>
+V8_INLINE Handle<T> handle(Tagged<T> object, LocalHeap* local_heap) {
+  return Handle<T>(object, local_heap);
+}
+
+template <typename T>
+V8_INLINE Handle<T> handle(T object, Isolate* isolate) {
+  static_assert(kTaggedCanConvertToRawObjects);
+  return handle(Tagged<T>(object), isolate);
 }
 
 template <typename T>
 V8_INLINE Handle<T> handle(T object, LocalIsolate* isolate) {
-  return Handle<T>(object, isolate);
+  static_assert(kTaggedCanConvertToRawObjects);
+  return handle(Tagged<T>(object), isolate);
 }
 
 template <typename T>
 V8_INLINE Handle<T> handle(T object, LocalHeap* local_heap) {
-  return Handle<T>(object, local_heap);
+  static_assert(kTaggedCanConvertToRawObjects);
+  return handle(Tagged<T>(object), local_heap);
 }
 
 template <typename T>
@@ -161,9 +179,12 @@ Handle<T> HandleScope::CloseAndEscape(Handle<T> handle_value) {
 
 Address* HandleScope::CreateHandle(Isolate* isolate, Address value) {
   DCHECK(AllowHandleAllocation::IsAllowed());
+  DCHECK(isolate->main_thread_local_heap()->IsRunning());
+  DCHECK_WITH_MSG(isolate->thread_id() == ThreadId::Current(),
+                  "main-thread handle can only be created on the main thread.");
   HandleScopeData* data = isolate->handle_scope_data();
   Address* result = data->next;
-  if (result == data->limit) {
+  if (V8_UNLIKELY(result == data->limit)) {
     result = Extend(isolate);
   }
   // Update the current next field, set the value in the created handle,
@@ -174,16 +195,6 @@ Address* HandleScope::CreateHandle(Isolate* isolate, Address value) {
                                           sizeof(Address));
   *result = value;
   return result;
-}
-
-Address* HandleScope::GetHandle(Isolate* isolate, Address value) {
-  DCHECK(AllowHandleAllocation::IsAllowed());
-  DCHECK(isolate->main_thread_local_heap()->IsRunning());
-  DCHECK_WITH_MSG(isolate->thread_id() == ThreadId::Current(),
-                  "main-thread handle can only be created on the main thread.");
-  HandleScopeData* data = isolate->handle_scope_data();
-  CanonicalHandleScope* canonical = data->canonical_scope;
-  return canonical ? canonical->Lookup(value) : CreateHandle(isolate, value);
 }
 
 #ifdef DEBUG

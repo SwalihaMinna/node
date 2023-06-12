@@ -478,7 +478,8 @@ class V8_EXPORT_PRIVATE InstructionSelector final {
   void AppendDeoptimizeArguments(InstructionOperandVector* args,
                                  DeoptimizeReason reason, NodeId node_id,
                                  FeedbackSource const& feedback,
-                                 FrameState frame_state);
+                                 FrameState frame_state,
+                                 DeoptimizeKind kind = DeoptimizeKind::kEager);
 
   void EmitTableSwitch(const SwitchInfo& sw,
                        InstructionOperand const& index_operand);

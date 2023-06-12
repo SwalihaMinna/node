@@ -2690,28 +2690,16 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
 
   // Required by V8.
   void db(uint8_t data) { dc8(data); }
-  void dd(uint32_t data, RelocInfo::Mode rmode = RelocInfo::NO_INFO) {
+  void dd(uint32_t data) {
     BlockPoolsScope no_pool_scope(this);
-    if (!RelocInfo::IsNoInfo(rmode)) {
-      DCHECK(RelocInfo::IsLiteralConstant(rmode));
-      RecordRelocInfo(rmode);
-    }
     dc32(data);
   }
-  void dq(uint64_t data, RelocInfo::Mode rmode = RelocInfo::NO_INFO) {
+  void dq(uint64_t data) {
     BlockPoolsScope no_pool_scope(this);
-    if (!RelocInfo::IsNoInfo(rmode)) {
-      DCHECK(RelocInfo::IsLiteralConstant(rmode));
-      RecordRelocInfo(rmode);
-    }
     dc64(data);
   }
-  void dp(uintptr_t data, RelocInfo::Mode rmode = RelocInfo::NO_INFO) {
+  void dp(uintptr_t data) {
     BlockPoolsScope no_pool_scope(this);
-    if (!RelocInfo::IsNoInfo(rmode)) {
-      DCHECK(RelocInfo::IsLiteralConstant(rmode));
-      RecordRelocInfo(rmode);
-    }
     dc64(data);
   }
 
@@ -2725,7 +2713,7 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   }
 
   ptrdiff_t InstructionOffset(Instruction* instr) const {
-    return reinterpret_cast<byte*>(instr) - buffer_start_;
+    return reinterpret_cast<uint8_t*>(instr) - buffer_start_;
   }
 
   // Register encoding.
@@ -2985,8 +2973,15 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
     return op << NEONModImmOp_offset;
   }
 
-  static bool IsImmLSUnscaled(int64_t offset);
-  static bool IsImmLSScaled(int64_t offset, unsigned size);
+  static constexpr bool IsImmLSUnscaled(int64_t offset) {
+    return is_int9(offset);
+  }
+  static constexpr bool IsImmLSScaled(int64_t offset, unsigned size) {
+    bool offset_is_size_multiple =
+        (static_cast<int64_t>(static_cast<uint64_t>(offset >> size) << size) ==
+         offset);
+    return offset_is_size_multiple && is_uint12(offset >> size);
+  }
   static bool IsImmLLiteral(int64_t offset);
 
   // Move immediates encoding.
@@ -3082,6 +3077,9 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   inline const Register& AppropriateZeroRegFor(const CPURegister& reg) const;
 
   void LoadStore(const CPURegister& rt, const MemOperand& addr, LoadStoreOp op);
+  inline void LoadStoreScaledImmOffset(Instr memop, int offset, unsigned size);
+  inline void LoadStoreUnscaledImmOffset(Instr memop, int offset);
+  inline void LoadStoreWRegOffset(Instr memop, const Register& regoffset);
   void LoadStorePair(const CPURegister& rt, const CPURegister& rt2,
                      const MemOperand& addr, LoadStorePairOp op);
   void LoadStoreStruct(const VRegister& vt, const MemOperand& addr,
@@ -3403,7 +3401,7 @@ class PatchingAssembler : public Assembler {
   // relocation information takes space in the buffer, the PatchingAssembler
   // will crash trying to grow the buffer.
   // Note that the instruction cache will not be flushed.
-  PatchingAssembler(const AssemblerOptions& options, byte* start,
+  PatchingAssembler(const AssemblerOptions& options, uint8_t* start,
                     unsigned count)
       : Assembler(options,
                   ExternalAssemblerBuffer(start, count * kInstrSize + kGap)),

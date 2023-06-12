@@ -228,6 +228,7 @@ class V8FileLogger : public LogEventListener {
                 Handle<HeapObject> name_or_sfi = Handle<HeapObject>());
   void MapCreate(Map map);
   void MapDetails(Map map);
+  void MapMoveEvent(Map from, Map to);
 
   void SharedLibraryEvent(const std::string& library_path, uintptr_t start,
                           uintptr_t end, intptr_t aslr_slide);
@@ -268,6 +269,14 @@ class V8FileLogger : public LogEventListener {
         etw_jit_logger_ != nullptr ||
 #endif
         is_logging() || jit_logger_ != nullptr;
+  }
+
+  bool allows_code_compaction() override {
+#if defined(V8_OS_WIN) && defined(V8_ENABLE_ETW_STACK_WALKING)
+    return etw_jit_logger_ == nullptr;
+#else
+    return true;
+#endif
   }
 
   void LogExistingFunction(Handle<SharedFunctionInfo> shared,

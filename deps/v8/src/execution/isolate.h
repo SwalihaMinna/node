@@ -41,8 +41,10 @@
 #include "src/objects/contexts.h"
 #include "src/objects/debug-objects.h"
 #include "src/objects/js-objects.h"
+#include "src/objects/tagged.h"
 #include "src/runtime/runtime.h"
-#include "src/sandbox/external-pointer.h"
+#include "src/sandbox/code-pointer-table.h"
+#include "src/sandbox/external-pointer-table.h"
 #include "src/utils/allocation.h"
 
 #ifdef DEBUG
@@ -509,8 +511,6 @@ using DebugObjectCache = std::vector<Handle<HeapObject>>;
   V(WasmAsyncResolvePromiseCallback, wasm_async_resolve_promise_callback,     \
     DefaultWasmAsyncResolvePromiseCallback)                                   \
   V(WasmLoadSourceMapCallback, wasm_load_source_map_callback, nullptr)        \
-  V(WasmSimdEnabledCallback, wasm_simd_enabled_callback, nullptr)             \
-  V(WasmExceptionsEnabledCallback, wasm_exceptions_enabled_callback, nullptr) \
   V(WasmGCEnabledCallback, wasm_gc_enabled_callback, nullptr)                 \
   /* State for Relocatable. */                                                \
   V(Relocatable*, relocatable_top, nullptr)                                   \
@@ -530,8 +530,6 @@ using DebugObjectCache = std::vector<Handle<HeapObject>>;
   V(size_t, num_cpu_profilers, 0)                                             \
   /* true if a trace is being formatted through Error.prepareStackTrace. */   \
   V(bool, formatting_stack_trace, false)                                      \
-  /* Perform side effect checks on function call and API callbacks. */        \
-  V(DebugInfo::ExecutionMode, debug_execution_mode, DebugInfo::kBreakpoints)  \
   V(bool, disable_bytecode_flushing, false)                                   \
   V(int, last_console_context_id, 0)                                          \
   V(v8_inspector::V8Inspector*, inspector, nullptr)                           \
@@ -835,9 +833,10 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     return &thread_local_top()->c_entry_fp_;
   }
   static uint32_t c_entry_fp_offset() {
-    return static_cast<uint32_t>(
-        OFFSET_OF(Isolate, thread_local_top()->c_entry_fp_) -
-        isolate_root_bias());
+    return static_cast<uint32_t>(OFFSET_OF(Isolate, isolate_data_) +
+                                 OFFSET_OF(IsolateData, thread_local_top_) +
+                                 OFFSET_OF(ThreadLocalTop, c_entry_fp_) -
+                                 isolate_root_bias());
   }
   inline Address* handler_address() { return &thread_local_top()->handler_; }
   inline Address* c_function_address() {
@@ -962,9 +961,11 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 
   // Exception throwing support. The caller should use the result
   // of Throw() as its return value.
-  Object Throw(Object exception) { return ThrowInternal(exception, nullptr); }
-  Object ThrowAt(Handle<JSObject> exception, MessageLocation* location);
-  Object ThrowIllegalOperation();
+  Tagged<Object> Throw(Object exception) {
+    return ThrowInternal(exception, nullptr);
+  }
+  Tagged<Object> ThrowAt(Handle<JSObject> exception, MessageLocation* location);
+  Tagged<Object> ThrowIllegalOperation();
 
   template <typename T>
   V8_WARN_UNUSED_RESULT MaybeHandle<T> Throw(Handle<Object> exception) {
@@ -1137,7 +1138,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   }
   TieringManager* tiering_manager() { return tiering_manager_; }
   CompilationCache* compilation_cache() { return compilation_cache_; }
-  V8FileLogger* v8_file_logger() {
+  V8FileLogger* v8_file_logger() const {
     // Call InitializeLoggingAndCounters() if logging is needed before
     // the isolate is fully initialized.
     DCHECK_NOT_NULL(v8_file_logger_);
@@ -1262,7 +1263,9 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     // flag in ThreadLocalTop in thread_in_wasm_flag_address_. This function
     // here returns the offset of that member from {isolate_root()}.
     return static_cast<uint32_t>(
-        OFFSET_OF(Isolate, thread_local_top()->thread_in_wasm_flag_address_) -
+        OFFSET_OF(Isolate, isolate_data_) +
+        OFFSET_OF(IsolateData, thread_local_top_) +
+        OFFSET_OF(ThreadLocalTop, thread_in_wasm_flag_address_) -
         isolate_root_bias());
   }
 
@@ -1276,7 +1279,9 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     return descriptor_lookup_cache_;
   }
 
-  V8_INLINE HandleScopeData* handle_scope_data() { return &handle_scope_data_; }
+  V8_INLINE HandleScopeData* handle_scope_data() {
+    return &isolate_data_.handle_scope_data_;
+  }
 
   HandleScopeImplementer* handle_scope_implementer() const {
     DCHECK(handle_scope_implementer_);
@@ -1330,15 +1335,34 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   Debug* debug() const { return debug_; }
 
   bool is_profiling() const {
-    return isolate_data_.is_profiling_.load(std::memory_order_relaxed);
+    return isolate_data_.execution_mode_ &
+           IsolateExecutionModeFlag::kIsProfiling;
   }
 
   void SetIsProfiling(bool enabled) {
     if (enabled) {
       CollectSourcePositionsForAllBytecodeArrays();
     }
-    isolate_data_.is_profiling_.store(enabled, std::memory_order_relaxed);
+    isolate_data_.execution_mode_.set(IsolateExecutionModeFlag::kIsProfiling,
+                                      enabled);
     UpdateLogObjectRelocation();
+  }
+
+  // Perform side effect checks on function calls and API callbacks.
+  // See Debug::StartSideEffectCheckMode().
+  bool should_check_side_effects() const {
+    return isolate_data_.execution_mode_ &
+           IsolateExecutionModeFlag::kCheckSideEffects;
+  }
+
+  DebugInfo::ExecutionMode debug_execution_mode() const {
+    return should_check_side_effects() ? DebugInfo::kSideEffects
+                                       : DebugInfo::kBreakpoints;
+  }
+  void set_debug_execution_mode(DebugInfo::ExecutionMode debug_execution_mode) {
+    bool check_side_effects = debug_execution_mode == DebugInfo::kSideEffects;
+    isolate_data_.execution_mode_.set(
+        IsolateExecutionModeFlag::kCheckSideEffects, check_side_effects);
   }
 
   Logger* logger() const { return logger_; }
@@ -1398,7 +1422,11 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 
   bool initialized_from_snapshot() { return initialized_from_snapshot_; }
 
-  bool NeedsSourcePositionsForProfiling() const;
+  bool NeedsSourcePositions() const;
+
+  bool IsLoggingCodeCreation() const;
+
+  bool AllowsCodeCompaction() const;
 
   bool NeedsDetailedOptimizedCodeLineInfo() const;
 
@@ -1494,7 +1522,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   }
   void UpdateTypedArraySpeciesLookupChainProtectorOnSetPrototype(
       Handle<JSObject> object);
-  void UpdateNumberStringPrototypeNoReplaceProtectorOnSetPrototype(
+  void UpdateNumberStringNotRegexpLikeProtectorOnSetPrototype(
       Handle<JSObject> object);
   void UpdateNoElementsProtectorOnNormalizeElements(Handle<JSObject> object) {
     UpdateNoElementsProtectorOnSetElement(object);
@@ -1561,10 +1589,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   bool* force_slow_path_address() { return &force_slow_path_; }
 
   bool jitless() const { return jitless_; }
-
-  DebugInfo::ExecutionMode* debug_execution_mode_address() {
-    return &debug_execution_mode_;
-  }
 
   base::RandomNumberGenerator* random_number_generator();
 
@@ -2182,7 +2206,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   StackTrace::StackTraceOptions stack_trace_for_uncaught_exceptions_options_ =
       StackTrace::kOverview;
   DescriptorLookupCache* descriptor_lookup_cache_ = nullptr;
-  HandleScopeData handle_scope_data_;
   HandleScopeImplementer* handle_scope_implementer_ = nullptr;
   UnicodeCache* unicode_cache_ = nullptr;
   AccountingAllocator* allocator_ = nullptr;
@@ -2353,7 +2376,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   bool initialized_ = false;
   bool jitless_ = false;
 
-  int next_optimization_id_ = 0;
+  std::atomic<int> next_optimization_id_ = 0;
 
 #if V8_SFI_HAS_UNIQUE_ID
   std::atomic<int> next_unique_sfi_id_;
